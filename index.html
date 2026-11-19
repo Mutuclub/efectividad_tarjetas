@@ -58,6 +58,7 @@ select,input[type=date]{font-family:inherit;font-size:13px;padding:6px 8px;borde
 table{border-collapse:collapse;width:100%;font-size:13px}
 th,td{padding:7px 8px;border-bottom:1px solid var(--grid);text-align:left;white-space:nowrap}
 th{font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:var(--ink2);font-weight:600;background:var(--surface);position:sticky;top:0;cursor:pointer;user-select:none}
+.kpis{grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
 td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
 tr.click{cursor:pointer}
 tr.click:hover td{background:#f0efec}
@@ -174,6 +175,7 @@ tr.tot td{font-weight:600;border-top:2px solid var(--axis)}
         <select id="selEst">
           <option value="pend">Pendientes (cobro + retorno)</option>
           <option value="pendiente">Pendientes de cobro</option>
+          <option value="vencida">Pendientes con fecha de pago vencida</option>
           <option value="retorno">Pendientes de retorno</option>
           <option value="cobrada">Cobradas</option>
           <option value="regresada">Regresadas sin cobro</option>
@@ -199,7 +201,7 @@ const REVISAR_CADA_MIN = 10;   // cada cuánto revisa si el archivo cambió (con
 const NO_CAMPO = ['DEPOSITO','PAGO EN OFICINA','ASESOR','FORANEO'];   // "cobradores" que no son de campo
 const META_VERDE = 80, META_AMARILLO = 60;
 const SEMANAS_TENDENCIA = 12;
-const LS_KEY = 'efectividadTarjetas_v1';
+const LS_KEY = 'efectividadTarjetas_v2';
 const COL = {cobrada:'#0ca30c', otro:'#2a78d6', regresada:'#d03b3b', pendiente:'#fab219', cancelada:'#b9b8b2'};
 const ETQ = {cobrada:'Cobrada', otro:'Pagó por otro medio', regresada:'Regresada sin cobro', pendiente:'Pendiente de cobro', cancelada:'Cancelada'};
 
@@ -266,7 +268,9 @@ function procesarLibro(wb, nombreArchivo){
       dom: r['Domicilio de Cobro']||r['Domicilio Particular']||'',
       men: num(r['Pagos de']),
       ret: parseFecha(r['Retorno Tarjeta 01']),
-      canc: String(r['Cancela']??'').trim()==='-1'
+      canc: String(r['Cancela']??'').trim()==='-1',
+      ini: parseFecha(r['Fecha Inicio Vigencia']),
+      porPagar: Math.max(0, num(r['Costo']) - num(r['Pago Inicial']))   // monto a mensualidades (sin enganche)
     });
   }
   // Pagos (Bd Pagos + Pagos Historicos, sin duplicados)
@@ -280,6 +284,7 @@ function procesarLibro(wb, nombreArchivo){
   for(const r of rows('Bd Pagos')) addPago(r['IdPoliza'],parseFecha(r['Fecha Pago']),num(r['Monto de Pago']),r['Notas'],r['Número de Recibo']);
   for(const r of rows('Pagos Historicos')) addPago(r['IdPoliza'],parseFecha(r['Fecha Pago']),num(r['Monto de Pago']),r['Nota de Pago'],r['Número de Recibo']);
   for(const a of pagos.values()) a.sort((x,y)=>x.f-y.f);
+  const pagadoTotal = id => (pagos.get(id)||[]).reduce((s,p)=>s+p.m,0);
 
   // Envíos
   let env=[];
@@ -308,7 +313,9 @@ function procesarLibro(wb, nombreArchivo){
       id:e.id, f:e.f, cob:e.cob, emp:c.emp, nom:c.nom, tel:c.tel, col:c.col, dom:c.dom, men:c.men,
       est, sinRet, ret: nx==null ? (retornada?c.ret:null) : null, sig:nx,
       pf: ps.length?ps[0].f:null, pm: ps.reduce((s,p)=>s+p.m,0), pn: ps.length?ps[0].nota:'', prec: ps.length?ps[0].rec:'',
-      dias: Math.max(0,Math.round((hoy-e.f)/DAY))
+      dias: Math.max(0,Math.round((hoy-e.f)/DAY)),
+      // para calcular la fecha de pago de las pendientes
+      ini: c.ini??null, porPagar: c.porPagar||0, pagado: est==='pendiente' ? pagadoTotal(e.id) : 0
     });
   }
   let maxF=0; for(const e of out) if(e.f>maxF) maxF=e.f;
@@ -453,13 +460,40 @@ function rangoActual(){
 function base(){ // envíos que pasan filtros de empresa/campo (sin periodo ni cobrador)
   return DATA.envios.filter(e=>(!ST.emp || e.emp===ST.emp) && (!ST.campo || !NO_CAMPO.includes(e.cob)));
 }
+/* ---- Fecha de pago de una tarjeta pendiente ----
+   Misma regla que Consulta de Pólizas: la mensualidad vence el mismo día del mes que el inicio de vigencia;
+   la 1a vence un mes después del inicio. Mensualidades cubiertas = pagos ÷ mensualidad (el enganche no cuenta). */
+function sumarMeses(t,n){ const d=new Date(t), dia=d.getDate(); const x=new Date(d.getFullYear(), d.getMonth()+n, 1); const ult=new Date(x.getFullYear(),x.getMonth()+1,0).getDate(); x.setDate(Math.min(dia,ult)); return x.getTime(); }
+const VC=new Map();
+function venc(e){
+  if(e.est!=='pendiente') return null;
+  const hoy=hoy0(), ck=e.id+'|'+e.f+'|'+hoy; if(VC.has(ck)) return VC.get(ck);
+  let v;
+  if(e.ini==null || !(e.men>0)) v={sinFecha:true, vencida:false};
+  else {
+    const cuotas=Math.ceil(e.porPagar/e.men - 1e-6), cubiertas=Math.floor(e.pagado/e.men + 1e-6);
+    if(cuotas>0 && cubiertas>=cuotas) v={pagada:true, vencida:false};
+    else {
+      const fp=sumarMeses(e.ini, cubiertas+1);
+      let n=0; while(sumarMeses(e.ini,cubiertas+1+n)<hoy && (cuotas<=0 || cubiertas+n<cuotas)) n++;
+      const resta=Math.max(0,e.porPagar-e.pagado);
+      v={fp, vencida: fp<hoy, diasV: Math.max(0,Math.round((hoy-fp)/DAY)), mensV:n, saldoV: Math.min(n*e.men, resta||n*e.men)};
+    }
+  }
+  VC.set(ck,v); return v;
+}
 function resumir(list){
-  const r={ent:0,cobrada:0,otro:0,regresada:0,pendiente:0,cancelada:0,sinRet:0,asig:0,cobMonto:0,p7:0,p30:0,p30m:0};
+  const r={ent:0,cobrada:0,otro:0,regresada:0,pendiente:0,cancelada:0,sinRet:0,asig:0,cobMonto:0,p7:0,p30:0,p30m:0,
+           venc:0,vencMonto:0,vencSaldo:0,v15:0,v30:0,v30m:0,sinFecha:0};
   for(const e of list){
     r.ent++; r[e.est]++; if(e.sinRet) r.sinRet++;
     if(e.est!=='cancelada') r.asig+=e.men;
     if(e.est==='cobrada'||e.est==='otro') r.cobMonto+=e.pm;
-    if(e.est==='pendiente'){ if(e.dias<=7) r.p7++; else if(e.dias<=30) r.p30++; else r.p30m++; }
+    if(e.est==='pendiente'){ if(e.dias<=7) r.p7++; else if(e.dias<=30) r.p30++; else r.p30m++;
+      const v=venc(e);
+      if(v.sinFecha) r.sinFecha++;
+      if(v.vencida){ r.venc++; r.vencMonto+=e.men; r.vencSaldo+=v.saldoV; if(v.diasV<=15) r.v15++; else if(v.diasV<=30) r.v30++; else r.v30m++; }
+    }
   }
   r.cob = r.cobrada + (ST.otros? r.otro : 0);
   r.den = r.ent - r.cancelada;
@@ -482,11 +516,15 @@ function render(){
   $('noteRecent').innerHTML = `⏳ ${int(recientes)} de las tarjetas del periodo se enviaron hace menos de 21 días; es normal que aún aparezcan como pendientes (la mitad de los pagos llega unos 13 días después del envío).`;
 
   const k=(t,v,s,c,hero)=>`<div class="kpi${hero?' hero':''}"><div class="t">${c?`<span class="dot" style="background:${c}"></span>`:''}${t}</div><div class="v">${v}</div><div class="s">${s||''}</div></div>`;
+  const kVenc=r=>`<div class="kpi" style="border:2px solid var(--crit)"><div class="t"><span class="dot" style="background:var(--crit)"></span>Pendientes con pago vencido</div>
+    <div class="v">${int(r.venc)}</div>
+    <div class="s"><b style="color:var(--ink)">${money(r.vencMonto)}</b> en mensualidades · saldo vencido ${money(r.vencSaldo)}<br>Días vencida: 1–15: ${int(r.v15)} · 16–30: ${int(r.v30)} · +30: ${int(r.v30m)}${r.sinFecha?` · sin fecha: ${int(r.sinFecha)}`:''}</div></div>`;
   $('kpis').innerHTML=
     k('% de efectividad', fmtP(r.pct), semaforo(r.pct)+` &nbsp;${int(r.cob)} de ${int(r.den)}`, null, true)+
     k('Tarjetas entregadas', int(r.ent), (ST.cob||'Todos los cobradores'))+
     k('Cobradas', int(r.cob), `${money(r.cobMonto)} cobrado${r.otro?` · ${int(r.otro)} por depósito/oficina${ST.otros?'':' (no cuentan)'}`:''}`, COL.cobrada)+
-    k('Pendientes de cobro', int(r.pendiente), `≤7 días: ${int(r.p7)} · 8–30: ${int(r.p30)} · +30: ${int(r.p30m)}`, COL.pendiente)+
+    k('Pendientes de cobro', int(r.pendiente), `Días desde el envío: ≤7: ${int(r.p7)} · 8–30: ${int(r.p30)} · +30: ${int(r.p30m)}`, COL.pendiente)+
+    kVenc(r)+
     k('Pendientes de retorno', int(r.sinRet), 'Cobradas sin retorno capturado', '#6250d6')+
     k('Regresadas sin cobro', int(r.regresada), r.cancelada?`Canceladas (no cuentan): ${int(r.cancelada)}`:'Tarjeta devuelta sin pago', COL.regresada);
 
@@ -496,7 +534,7 @@ function render(){
 }
 
 function semanasTendencia(b,d1){
-  let fin=lunes(d1), ini;
+  let fin=lunes(Math.min(d1, DATA.maxEnvio)), ini;
   if(ST.modo==='rango' && ST.desde!=null && (d1-ST.desde)/DAY>=28) ini=lunes(ST.desde);
   else ini=fin-(SEMANAS_TENDENCIA-1)*7*DAY;
   const minF=Math.min(...b.map(e=>e.f)); if(ini<lunes(minF)) ini=lunes(minF);
@@ -581,12 +619,12 @@ function renderRanking(per){
   let rows=[...g.entries()].map(([c,l])=>({c,...resumir(l)}));
   const s=ST.sort; rows.sort((a,b)=>{ const x=a[s.k],y=b[s.k]; if(typeof x==='string') return x.localeCompare(y)*s.d; return ((x??-1)-(y??-1))*s.d; });
   const tot=resumir(per);
-  const cols=[['c','Cobrador'],['ent','Entregadas',1],['cob','Cobradas',1],['pendiente','Pend. cobro',1],['sinRet','Pend. retorno',1],['regresada','Regresadas',1],['cobMonto','Cobrado $',1],['pct','Efectividad',1],[null,'Semáforo']];
+  const cols=[['c','Cobrador'],['ent','Entregadas',1],['cob','Cobradas',1],['pendiente','Pend. cobro',1],['venc','Pago vencido',1],['vencMonto','Monto vencido',1],['sinRet','Pend. retorno',1],['regresada','Regresadas',1],['cobMonto','Cobrado $',1],['pct','Efectividad',1],[null,'Semáforo']];
   const th=cols.map(c=>`<th class="${c[2]?'n':''}" data-k="${c[0]||''}">${c[1]}${s.k===c[0]?(s.d>0?' ▲':' ▼'):''}</th>`).join('');
-  const fila=(r,cls)=>`<tr class="${cls}" data-c="${esc(r.c)}"><td>${esc(r.c)}</td><td class="n">${int(r.ent)}</td><td class="n">${int(r.cob)}</td><td class="n">${int(r.pendiente)}</td><td class="n">${int(r.sinRet)}</td><td class="n">${int(r.regresada)}</td><td class="n">${money(r.cobMonto)}</td>
+  const fila=(r,cls)=>`<tr class="${cls}" data-c="${esc(r.c)}"><td>${esc(r.c)}</td><td class="n">${int(r.ent)}</td><td class="n">${int(r.cob)}</td><td class="n">${int(r.pendiente)}</td><td class="n" style="${r.venc?'color:var(--crit);font-weight:600':''}">${int(r.venc)}</td><td class="n">${money(r.vencMonto)}</td><td class="n">${int(r.sinRet)}</td><td class="n">${int(r.regresada)}</td><td class="n">${money(r.cobMonto)}</td>
     <td class="n"><div class="bar"><div class="bg"><div class="fg" style="width:${r.pct??0}%;background:${semColor(r.pct)}"></div></div><span style="min-width:52px">${fmtP(r.pct)}</span></div></td><td>${semaforo(r.pct)}</td></tr>`;
   $('tblRank').innerHTML=`<thead><tr>${th}</tr></thead><tbody>${rows.map(r=>fila(r,'click'+(r.c===ST.cob?' sel':''))).join('')}${fila({c:'TOTAL',...tot},'tot')}</tbody>`;
-  if(!rows.length) $('tblRank').innerHTML+=`<tr><td colspan="9" style="text-align:center;color:#898781;padding:20px">Sin tarjetas en el periodo</td></tr>`;
+  if(!rows.length) $('tblRank').innerHTML+=`<tr><td colspan="11" style="text-align:center;color:#898781;padding:20px">Sin tarjetas en el periodo</td></tr>`;
   $('tblRank').querySelectorAll('th[data-k]').forEach(t=>{ if(!t.dataset.k) return; t.onclick=()=>{ const k=t.dataset.k; ST.sort = ST.sort.k===k ? {k,d:-ST.sort.d} : {k,d:k==='c'?1:-1}; renderRanking(per); }; });
   $('tblRank').querySelectorAll('tr.click').forEach(tr=>tr.onclick=()=>{ ST.cob = ST.cob===tr.dataset.c ? '' : tr.dataset.c; $('selCob').value=ST.cob; render(); if(ST.cob) $('cardDet').scrollIntoView({behavior:'smooth'}); });
 }
@@ -594,10 +632,16 @@ function renderRanking(per){
 function filasDetalle(){
   const [d0,d1]=rangoActual();
   let l=base().filter(e=>e.f>=d0&&e.f<=d1&&(!ST.cob||e.cob===ST.cob));
-  const f={pend:e=>e.est==='pendiente'||e.sinRet, pendiente:e=>e.est==='pendiente', retorno:e=>e.sinRet, cobrada:e=>e.est==='cobrada'||e.est==='otro', regresada:e=>e.est==='regresada', cancelada:e=>e.est==='cancelada', todas:()=>true}[ST.est];
+  const f={pend:e=>e.est==='pendiente'||e.sinRet, pendiente:e=>e.est==='pendiente', vencida:e=>e.est==='pendiente'&&venc(e).vencida, retorno:e=>e.sinRet, cobrada:e=>e.est==='cobrada'||e.est==='otro', regresada:e=>e.est==='regresada', cancelada:e=>e.est==='cancelada', todas:()=>true}[ST.est];
   return l.filter(f).sort((a,b)=>a.cob.localeCompare(b.cob)||a.f-b.f||a.id.localeCompare(b.id));
 }
-function estTexto(e){ let t=ETQ[e.est]; if(e.sinRet) t+=' · sin retorno'; return t; }
+function estTexto(e){ let t=ETQ[e.est]; if(e.sinRet) t+=' · sin retorno'; if(e.est==='pendiente'&&venc(e).vencida) t+=' · pago vencido'; return t; }
+function celdasVenc(e){
+  const v=venc(e); if(!v) return '<td></td><td></td><td></td>';
+  if(v.sinFecha) return '<td style="color:#898781">Sin fecha</td><td></td><td></td>';
+  if(v.pagada) return '<td style="color:#898781">Liquidada</td><td></td><td></td>';
+  return `<td style="${v.vencida?'color:var(--crit);font-weight:600':''}">${fmtF(v.fp)}</td><td class="n">${v.vencida?v.diasV:''}</td><td class="n">${v.vencida?money(v.saldoV):''}</td>`;
+}
 function renderDetalle(){
   if(!DATA) return;
   const l=filasDetalle(), [d0,d1]=rangoActual();
@@ -606,19 +650,19 @@ function renderDetalle(){
   $('detTitle').textContent=tit;
   $('detHint').textContent=`${$('selEst').selectedOptions[0].text} · ${per} · ${int(l.length)} tarjetas`;
   const r=resumir(base().filter(e=>e.f>=d0&&e.f<=d1&&(!ST.cob||e.cob===ST.cob)));
-  $('printHead').innerHTML=`<h1>${esc(tit)}</h1><div>${esc(per)} · Entregadas ${r.ent} · Cobradas ${r.cob} · Pendientes de cobro ${r.pendiente} · Pendientes de retorno ${r.sinRet} · Efectividad ${fmtP(r.pct)}</div><div style="font-size:11px;color:#52514e">Impreso ${fmtF(Date.now())} · ${esc($('selEst').selectedOptions[0].text)}</div>`;
+  $('printHead').innerHTML=`<h1>${esc(tit)}</h1><div>${esc(per)} · Entregadas ${r.ent} · Cobradas ${r.cob} · Pendientes de cobro ${r.pendiente} · Con pago vencido ${r.venc} (${money(r.vencMonto)}) · Pendientes de retorno ${r.sinRet} · Efectividad ${fmtP(r.pct)}</div><div style="font-size:11px;color:#52514e">Impreso ${fmtF(Date.now())} · ${esc($('selEst').selectedOptions[0].text)}</div>`;
   const showCob=!ST.cob;
-  const head=`<tr><th>Póliza</th><th>Cliente</th>${showCob?'<th>Cobrador</th>':''}<th>Empresa</th><th>Domicilio de cobro</th><th>Colonia</th><th>Teléfono</th><th>Envío</th><th class="n">Días</th><th class="n">Mensualidad</th><th>Estatus</th><th>Pago</th><th class="n">Monto</th></tr>`;
+  const head=`<tr><th>Póliza</th><th>Cliente</th>${showCob?'<th>Cobrador</th>':''}<th>Empresa</th><th>Domicilio de cobro</th><th>Colonia</th><th>Teléfono</th><th>Envío</th><th class="n">Días</th><th class="n">Mensualidad</th><th>Fecha de pago</th><th class="n">Días vencida</th><th class="n">Saldo vencido</th><th>Estatus</th><th>Pago</th><th class="n">Monto</th></tr>`;
   const MAX=1500;
   const body=l.slice(0,MAX).map(e=>`<tr><td>${esc(e.id)}</td><td>${esc(e.nom)}</td>${showCob?`<td>${esc(e.cob)}</td>`:''}<td>${esc(e.emp)}</td><td>${esc(e.dom)}</td><td>${esc(e.col)}</td><td>${esc(e.tel)}</td><td>${fmtF(e.f)}</td>
-    <td class="n">${e.est==='pendiente'?e.dias:''}</td><td class="n">${e.men?money(e.men):''}</td>
-    <td><span class="pill"><span class="dot" style="background:${COL[e.est]}"></span>${estTexto(e)}</span></td><td>${fmtF(e.pf)}</td><td class="n">${e.pm?money(e.pm):''}</td></tr>`).join('');
-  $('tblDet').innerHTML=`<thead>${head}</thead><tbody>${body||`<tr><td colspan="13" style="text-align:center;color:#898781;padding:20px">Sin tarjetas con este estatus</td></tr>`}${l.length>MAX?`<tr><td colspan="13" style="color:#898781">Se muestran ${MAX} de ${l.length}; exporta a Excel para ver todas.</td></tr>`:''}</tbody>`;
+    <td class="n">${e.est==='pendiente'?e.dias:''}</td><td class="n">${e.men?money(e.men):''}</td>${celdasVenc(e)}
+    <td><span class="pill"><span class="dot" style="background:${venc(e)?.vencida?'var(--crit)':COL[e.est]}"></span>${estTexto(e)}</span></td><td>${fmtF(e.pf)}</td><td class="n">${e.pm?money(e.pm):''}</td></tr>`).join('');
+  $('tblDet').innerHTML=`<thead>${head}</thead><tbody>${body||`<tr><td colspan="16" style="text-align:center;color:#898781;padding:20px">Sin tarjetas con este estatus</td></tr>`}${l.length>MAX?`<tr><td colspan="16" style="color:#898781">Se muestran ${MAX} de ${l.length}; exporta a Excel para ver todas.</td></tr>`:''}</tbody>`;
 }
 $('btnPrint').onclick=()=>window.print();
 $('btnXls').onclick=()=>{
   const l=filasDetalle();
-  const rows=l.map(e=>({'Póliza':e.id,'Cliente':e.nom,'Cobrador':e.cob,'Empresa':e.emp,'Domicilio de cobro':e.dom,'Colonia':e.col,'Teléfono':e.tel,'Fecha envío':fmtF(e.f),'Días sin cobro':e.est==='pendiente'?e.dias:'','Mensualidad':e.men,'Estatus':estTexto(e),'Fecha pago':fmtF(e.pf),'Monto pagado':e.pm||'','Nota del pago':e.pn,'Recibo':e.prec}));
+  const rows=l.map(e=>({'Póliza':e.id,'Cliente':e.nom,'Cobrador':e.cob,'Empresa':e.emp,'Domicilio de cobro':e.dom,'Colonia':e.col,'Teléfono':e.tel,'Fecha envío':fmtF(e.f),'Días sin cobro':e.est==='pendiente'?e.dias:'','Mensualidad':e.men,'Fecha de pago':(v=>v&&v.fp?fmtF(v.fp):'')(venc(e)),'Días vencida':(v=>v&&v.vencida?v.diasV:'')(venc(e)),'Mensualidades vencidas':(v=>v&&v.vencida?v.mensV:'')(venc(e)),'Saldo vencido':(v=>v&&v.vencida?v.saldoV:'')(venc(e)),'Estatus':estTexto(e),'Fecha pago':fmtF(e.pf),'Monto pagado':e.pm||'','Nota del pago':e.pn,'Recibo':e.prec}));
   const ws=XLSX.utils.json_to_sheet(rows), wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,'Tarjetas');
   XLSX.writeFile(wb,'Tarjetas_'+(ST.cob||'todos').replace(/\s+/g,'_')+'_'+isoDate(Date.now())+'.xlsx');
 };
